@@ -20,14 +20,14 @@ export const analyzeTranslation = async (
   const apiKey = userApiKey || (typeof process !== 'undefined' ? process.env.API_KEY : undefined);
 
   if (!apiKey || apiKey.trim() === '') {
-    return "API Key Missing: Please click the 'Set API Key' button in the header to configure your Google Gemini API key.";
+    return "API Key Missing: Please click the 'API Key' button in the header to configure your Google Gemini API key.";
   }
 
   if (!sourceText.trim() || !targetText.trim()) {
     return "Please provide both source and target text for analysis.";
   }
 
-  const maxRetries = 3;
+  const maxRetries = 4; 
   let attempt = 0;
 
   while (attempt < maxRetries) {
@@ -46,8 +46,9 @@ export const analyzeTranslation = async (
         Provide feedback in clear bullet points.
 
         TASK 2: WORD-BY-WORD MAPPING
-        You MUST provide a granular mapping for every significant word or phrase in the TARGET translation.
+        You MUST provide a granular mapping for every significant word or semantic unit in the TARGET translation.
         Identify the corresponding English word from the source and its grammatical context.
+        DO NOT leave the wordBreakdown array empty. Even if the translation is perfect, map every word.
 
         EXAMPLE MAPPING FORMAT:
         If Target is "Hola mundo" and Source is "Hello world":
@@ -57,8 +58,9 @@ export const analyzeTranslation = async (
         Return results strictly as a JSON object matching the requested schema.
       `;
 
+      // Use gemini-3-flash-preview for significantly higher rate limits on free tier
       const response = await ai.models.generateContent({
-        model: 'gemini-3-pro-preview',
+        model: 'gemini-3-flash-preview',
         contents: prompt,
         config: {
           responseMimeType: "application/json",
@@ -71,7 +73,7 @@ export const analyzeTranslation = async (
               },
               wordBreakdown: {
                 type: Type.ARRAY,
-                description: "A list of every word in the translation mapped to its source equivalent.",
+                description: "A complete mapping of every word in the translation to its source equivalent.",
                 items: {
                   type: Type.OBJECT,
                   properties: {
@@ -88,34 +90,45 @@ export const analyzeTranslation = async (
         },
       });
 
-      const result = response.text;
-      if (!result) throw new Error("Empty response");
+      const resultText = response.text;
+      if (!resultText) throw new Error("Empty response from AI service.");
       
-      return JSON.parse(result) as AnalysisResult;
+      const parsed = JSON.parse(resultText);
+      
+      if (!parsed.wordBreakdown || parsed.wordBreakdown.length === 0) {
+        throw new Error("AI failed to generate word mapping. Please try again.");
+      }
+
+      return parsed as AnalysisResult;
 
     } catch (error: any) {
-      const isRateLimit = error.message?.includes("429") || error.message?.includes("quota");
+      const isRateLimit = error.message?.includes("429") || 
+                          error.message?.includes("quota") || 
+                          error.message?.includes("limit") ||
+                          error.status === 429;
       
       if (isRateLimit && attempt < maxRetries - 1) {
         attempt++;
-        const delay = Math.pow(2, attempt) * 1000; // Exponential backoff: 2s, 4s...
-        console.warn(`Rate limit (429) hit. Retrying in ${delay}ms... (Attempt ${attempt}/${maxRetries})`);
+        // Use exponential backoff with jitter: 3s, 7s, 13s...
+        const delay = (Math.pow(2, attempt) * 1500) + (Math.random() * 1500) + 1000; 
+        console.warn(`Rate limit (429) hit. Attempt ${attempt}/${maxRetries}. Retrying in ${Math.round(delay)}ms...`);
         await sleep(delay);
         continue;
       }
 
-      console.error("Analysis Error Details:", error);
+      console.error("Analysis Error:", error);
       
       if (error.message?.includes("401")) {
-        return "Invalid API Key: Please check your key in the settings.";
+        return "Invalid API Key: Your key was rejected by Google. Please check your settings.";
       }
+      
       if (isRateLimit) {
-        return "The AI is currently busy (Rate Limit). Please wait a few moments and try again.";
+        return "⚠️ API Quota exceeded. The free tier has strict limits (often 15 requests per minute).\n\nPlease wait 60 seconds before trying again, or consider using a paid API key from a billing-enabled project (https://ai.google.dev/gemini-api/docs/billing).";
       }
       
       return `Analysis Failed: ${error.message || "An unexpected error occurred."}`;
     }
   }
 
-  return "Failed to connect after multiple attempts. Please check your internet or API quota.";
+  return "The service is temporarily unavailable due to high demand (Rate Limit). Please wait a few moments before trying again.";
 };
