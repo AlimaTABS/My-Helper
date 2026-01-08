@@ -14,7 +14,7 @@ const API_KEY_STORAGE = 'bilingual_proofreader_api_key';
 
 const App: React.FC = () => {
   const [targetLanguage, setTargetLanguage] = useState<string>(() => {
-    return localStorage.getItem(LANGUAGE_KEY) || 'Turkish';
+    return localStorage.getItem(LANGUAGE_KEY) || 'Spanish';
   });
 
   const [apiKey, setApiKey] = useState<string>(() => {
@@ -64,6 +64,7 @@ const App: React.FC = () => {
       status: SegmentStatus.Pending,
       category: SegmentCategory.None,
       aiFeedback: null,
+      wordBreakdown: [],
       isAnalyzing: false,
     };
     setSegments(prev => [...prev, newSegment]);
@@ -89,7 +90,6 @@ const App: React.FC = () => {
     const segment = segments.find(s => s.id === id);
     if (!segment) return;
 
-    // Check if key exists (either user provided or system provided)
     if (!apiKey && !process.env.API_KEY) {
       setIsApiKeyModalOpen(true);
       return;
@@ -105,17 +105,18 @@ const App: React.FC = () => {
     );
 
     if (typeof result === 'string') {
+        const isQuota = result.includes("429");
         updateSegment(id, { 
             isAnalyzing: false, 
             aiFeedback: result,
-            status: SegmentStatus.Reviewed
+            status: isQuota ? SegmentStatus.Pending : SegmentStatus.NeedsWork
         });
     } else {
         const analysis = result as AnalysisResult;
         updateSegment(id, { 
             isAnalyzing: false, 
             aiFeedback: analysis.feedback,
-            wordBreakdown: analysis.wordBreakdown,
+            wordBreakdown: analysis.wordBreakdown || [],
             status: SegmentStatus.Reviewed
         });
     }
