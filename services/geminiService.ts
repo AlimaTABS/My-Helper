@@ -15,10 +15,10 @@ export const analyzeTranslation = async (
   targetLanguage: string,
   userApiKey?: string
 ): Promise<AnalysisResult | string> => {
-  // Check for key availability
-  const apiKey = userApiKey || (typeof process !== 'undefined' ? process.env.API_KEY : undefined);
+  const apiKey =
+    userApiKey || (typeof process !== "undefined" ? process.env.API_KEY : undefined);
 
-  if (!apiKey || apiKey.trim() === '') {
+  if (!apiKey || apiKey.trim() === "") {
     return "API Key Missing: Please click the 'Set API Key' button in the header to configure your Google Gemini API key.";
   }
 
@@ -26,8 +26,12 @@ export const analyzeTranslation = async (
     return "Please provide both source and target text for analysis.";
   }
 
+  // retry config
+  const maxRetries = 3;        // number of retries (not total attempts)
+  const baseDelay = 500;       // ms
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
   try {
-    // Always create a new instance to ensure we use the latest provided key
     const ai = new GoogleGenAI({ apiKey });
 
     const prompt = `
@@ -50,54 +54,93 @@ export const analyzeTranslation = async (
       Return results strictly as a JSON object.
     `;
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-3-pro-preview',
-      contents: prompt,
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            feedback: { 
-              type: Type.STRING,
-              description: "The audit summary focusing on missing content, terminology, and meaning shifts."
-            },
-            wordBreakdown: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  targetWord: { type: Type.STRING },
-                  sourceEquivalent: { type: Type.STRING },
-                  context: { type: Type.STRING },
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        const response = await ai.models.generateContent({
+          model: "gemini-3-pro-preview",
+          contents: prompt,
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                feedback: {
+                  type: Type.STRING,
+                  description:
+                    "The audit summary focusing on missing content, terminology, and meaning shifts.",
                 },
-                required: ["targetWord", "sourceEquivalent", "context"],
+                wordBreakdown: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      targetWord: { type: Type.STRING },
+                      sourceEquivalent: { type: Type.STRING },
+                      context: { type: Type.STRING },
+                    },
+                    required: ["targetWord", "sourceEquivalent", "context"],
+                  },
+                },
               },
+              required: ["feedback", "wordBreakdown"],
             },
           },
-          required: ["feedback", "wordBreakdown"],
-        },
-      },
-    });
+        });
 
-    const result = response.text;
-    if (!result) throw new Error("The AI model returned an empty response.");
-    
-    return JSON.parse(result) as AnalysisResult;
+        const result = response.text;
+        if (!result) throw new Error("The AI model returned an empty response.");
+
+        return JSON.parse(result) as AnalysisResult;
+      } catch (err: any) {
+        const errorStr =
+          String(err?.message ?? err) +
+          " " +
+          String(err?.status ?? "") +
+          " " +
+          String(err?.code ?? "");
+
+        // Check for fatal errors that shouldn't be retried
+        if (errorStr.includes("403") || errorStr.includes("API_KEY_INVALID")) {
+          return "Invalid API Key. Please click the Key icon in the top right to verify your settings.";
+        }
+
+        // (Optional) keep your existing friendly messages too:
+        if (errorStr.includes("401")) {
+          return "Invalid API Key: The key you provided was rejected by Google. Please check your API key in the settings.";
+        }
+        if (errorStr.includes("blocked")) {
+          return "Safety Warning: The translation or source text was blocked by Google's safety filters.";
+        }
+
+        // 429 = Too Many Requests (Quota), 503/500 = Server issues
+        const isQuotaError =
+          errorStr.includes("429") || errorStr.toLowerCase().includes("quota");
+        const isServerError = errorStr.includes("503") || errorStr.includes("500");
+
+        const shouldRetry = (isQuotaError || isServerError) && attempt < maxRetries;
+
+        if (shouldRetry) {
+          const delay = baseDelay * Math.pow(2, attempt);
+          console.warn(
+            `Attempt ${attempt + 1} failed (${isQuotaError ? "Quota" : "Server"}). Retrying in ${delay}ms...`
+          );
+          await sleep(delay);
+          continue;
+        }
+
+        // No retry left (or not a retryable error)
+        if (isQuotaError) {
+          return "Quota Exceeded: You have reached the rate limit for your Gemini API key. Please wait a moment or check your billing status.";
+        }
+
+        return `Analysis Failed: ${err?.message || "An unexpected error occurred. Please check your internet connection."}`;
+      }
+    }
+
+    // Should never hit because loop returns, but just in case:
+    return "Analysis Failed: Exceeded maximum retries.";
   } catch (error: any) {
     console.error("Analysis Error Details:", error);
-    
-    // Provide more specific feedback for common errors
-    if (error.message?.includes("API_KEY_INVALID") || error.message?.includes("401")) {
-      return "Invalid API Key: The key you provided was rejected by Google. Please check your API key in the settings.";
-    }
-    if (error.message?.includes("429") || error.message?.includes("quota")) {
-      return "Quota Exceeded: You have reached the rate limit for your Gemini API key. Please wait a moment or check your billing status.";
-    }
-    if (error.message?.includes("blocked")) {
-      return "Safety Warning: The translation or source text was blocked by Google's safety filters.";
-    }
-    
-    return `Analysis Failed: ${error.message || "An unexpected error occurred. Please check your internet connection."}`;
+    return `Analysis Failed: ${error?.message || "An unexpected error occurred."}`;
   }
 };
