@@ -1,60 +1,77 @@
 import { GoogleGenAI, Type } from "@google/genai";
 
-function sleep(ms: number) {
-  return new Promise((r) => setTimeout(r, ms));
+export interface AnalysisResult {
+  feedback: string;
+  wordBreakdown: Array<{
+    targetWord: string;
+    sourceEquivalent: string;
+    context: string;
+  }>;
 }
 
-function getStatus(err: any): number | undefined {
-  return (
-    err?.status ??
-    err?.response?.status ??
-    err?.cause?.status
-  );
-}
-
-function cleanJsonText(s: string) {
-  let t = s.trim();
-  if (t.startsWith("```")) {
-    t = t.replace(/^```[a-zA-Z]*\n?/, "").replace(/```$/, "").trim();
-  }
-  return t;
-}
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 export const analyzeTranslation = async (
   sourceText: string,
   targetText: string,
   targetLanguage: string,
   userApiKey?: string
-) => {
-  const apiKey =
-    userApiKey || (typeof process !== "undefined" ? process.env.API_KEY : undefined);
+): Promise<AnalysisResult | string> => {
+  const apiKey = userApiKey || (typeof process !== 'undefined' ? process.env.API_KEY : undefined);
 
-  if (!apiKey || apiKey.trim() === "") {
+  if (!apiKey || apiKey.trim() === '') {
     return "API Key Missing: Please click the 'Set API Key' button in the header to configure your Google Gemini API key.";
   }
 
-  const ai = new GoogleGenAI({ apiKey });
+  if (!sourceText.trim() || !targetText.trim()) {
+    return "Please provide both source and target text for analysis.";
+  }
 
-  // Your specific model and high-precision prompt
-  const MODEL_NAME = "gemini-3-pro-preview";
-  const prompt = `Target Language: ${targetLanguage}\nSource: ${sourceText}\nTarget: ${targetText}\nReturn JSON.`;
+  const maxRetries = 3;
+  let attempt = 0;
 
-  const maxRetries = 3;   
-  const baseDelay = 2000; // Started at 2s to better handle the 15rpm limit
-
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+  while (attempt < maxRetries) {
     try {
+      const ai = new GoogleGenAI({ apiKey });
+
+      const prompt = `
+        You are an expert linguistic auditor performing a high-precision Translation Quality Audit (TQA).
+        
+        Target Language: ${targetLanguage}
+        Source (English): "${sourceText}"
+        Target Translation: "${targetText}"
+        
+        TASK 1: CRITICAL AUDIT
+        Compare the translation to the source. Identify mistranslations, omissions, or tone shifts.
+        Provide feedback in clear bullet points.
+
+        TASK 2: WORD-BY-WORD MAPPING
+        You MUST provide a granular mapping for every significant word or phrase in the TARGET translation.
+        Identify the corresponding English word from the source and its grammatical context.
+
+        EXAMPLE MAPPING FORMAT:
+        If Target is "Hola mundo" and Source is "Hello world":
+        - targetWord: "Hola", sourceEquivalent: "Hello", context: "Interjection, greeting"
+        - targetWord: "mundo", sourceEquivalent: "world", context: "Noun, singular"
+
+        Return results strictly as a JSON object matching the requested schema.
+      `;
+
       const response = await ai.models.generateContent({
-        model: MODEL_NAME,
+        model: 'gemini-3-pro-preview',
         contents: prompt,
         config: {
           responseMimeType: "application/json",
           responseSchema: {
             type: Type.OBJECT,
             properties: {
-              feedback: { type: Type.STRING },
+              feedback: { 
+                type: Type.STRING,
+                description: "The audit summary focusing on quality, accuracy, and suggested corrections."
+              },
               wordBreakdown: {
                 type: Type.ARRAY,
+                description: "A list of every word in the translation mapped to its source equivalent.",
                 items: {
                   type: Type.OBJECT,
                   properties: {
@@ -71,48 +88,34 @@ export const analyzeTranslation = async (
         },
       });
 
-      const text = response.text;
-      if (!text) throw new Error("Empty response.text from model.");
-
-      const cleaned = cleanJsonText(text);
-      let parsed: any = JSON.parse(cleaned);
-      if (typeof parsed === "string") parsed = JSON.parse(parsed);
-
-      return parsed;
-
-    } catch (err: any) {
-      const status = getStatus(err);
-      const msg = String(err?.message ?? err);
-      const errorStr = msg.toLowerCase();
-
-      // Check specifically for 429 Quota issues
-      const isQuota = status === 429 || errorStr.includes("429") || errorStr.includes("quota");
+      const result = response.text;
+      if (!result) throw new Error("Empty response");
       
-      // Check for Auth/Key issues (Don't retry these)
-      if (status === 401 || status === 403 || errorStr.includes("api_key_invalid")) {
-        return "Invalid API Key. Please verify your settings.";
-      }
-      
-      if (errorStr.includes("blocked") || errorStr.includes("leaked")) {
-        return "Your API key is blocked or leaked. Please create a new one in Google AI Studio.";
-      }
+      return JSON.parse(result) as AnalysisResult;
 
-      // Retry Logic: If it's a quota hit or server error, wait and try again
-      if ((isQuota || status === 500 || status === 503) && attempt < maxRetries) {
-        const delay = baseDelay * Math.pow(2, attempt) + Math.floor(Math.random() * 500);
-        console.warn(`Retry ${attempt + 1}/${maxRetries} after ${delay}ms due to: ${msg}`);
+    } catch (error: any) {
+      const isRateLimit = error.message?.includes("429") || error.message?.includes("quota");
+      
+      if (isRateLimit && attempt < maxRetries - 1) {
+        attempt++;
+        const delay = Math.pow(2, attempt) * 1000; // Exponential backoff: 2s, 4s...
+        console.warn(`Rate limit (429) hit. Retrying in ${delay}ms... (Attempt ${attempt}/${maxRetries})`);
         await sleep(delay);
         continue;
       }
 
-      // Final failure return for Quota
-      if (isQuota) {
-        return "⚠️ API Quota exceeded. The free tier has strict limits (often 15 requests per minute).\n\nPlease wait 60 seconds before trying again, or consider using a paid API key from a billing-enabled project ([https://ai.google.dev/gemini-api/docs/billing](https://ai.google.dev/gemini-api/docs/billing)).";
+      console.error("Analysis Error Details:", error);
+      
+      if (error.message?.includes("401")) {
+        return "Invalid API Key: Please check your key in the settings.";
       }
-
-      return `Analysis Failed: ${msg}`;
+      if (isRateLimit) {
+        return "The AI is currently busy (Rate Limit). Please wait a few moments and try again.";
+      }
+      
+      return `Analysis Failed: ${error.message || "An unexpected error occurred."}`;
     }
   }
 
-  return "Analysis Failed: All retry attempts exhausted.";
+  return "Failed to connect after multiple attempts. Please check your internet or API quota.";
 };
