@@ -14,12 +14,9 @@ function getStatus(err: any): number | undefined {
 
 function cleanJsonText(s: string) {
   let t = s.trim();
-
-  // strip ```json ... ``` fences if they ever appear
   if (t.startsWith("```")) {
     t = t.replace(/^```[a-zA-Z]*\n?/, "").replace(/```$/, "").trim();
   }
-
   return t;
 }
 
@@ -44,18 +41,16 @@ export const analyzeTranslation = async (
 
   const prompt = `Target Language: ${targetLanguage}\nSource: ${sourceText}\nTarget: ${targetText}\nReturn JSON.`;
 
-  const maxRetries = 3;   // 3 retries => up to 4 total attempts
-  const baseDelay = 500;  // ms
+  const maxRetries = 3;   
+  const baseDelay = 1000; // Increased base delay for stability
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
       const response = await ai.models.generateContent({
-        model: "gemini-3-pro-preview",
+        model: "gemini-1.5-flash", // Updated to a standard stable model name
         contents: prompt,
         config: {
           responseMimeType: "application/json",
-          // Prefer responseJsonSchema if your SDK version supports it.
-          // responseSchema also exists, but responseJsonSchema is the newer "raw JSON schema" path. :contentReference[oaicite:1]{index=1}
           responseSchema: {
             type: Type.OBJECT,
             properties: {
@@ -82,39 +77,41 @@ export const analyzeTranslation = async (
       if (!text) throw new Error("Empty response.text from model.");
 
       const cleaned = cleanJsonText(text);
-
-      // Handles rare cases where JSON is double-encoded as a string
       let parsed: any = JSON.parse(cleaned);
       if (typeof parsed === "string") parsed = JSON.parse(parsed);
 
       return parsed;
+
     } catch (err: any) {
       const status = getStatus(err);
       const msg = String(err?.message ?? err);
+      const errorStr = msg.toLowerCase();
 
-      // Fatal (don’t retry)
-      if (status === 401 || status === 403 || msg.includes("API_KEY_INVALID")) {
-        // 403/401 are typically “wrong key / no permission / restricted key”. :contentReference[oaicite:2]{index=2}
+      // 1. Check for Quota/429 specifically
+      const isQuota = status === 429 || errorStr.includes("429") || errorStr.includes("quota") || errorStr.includes("resource_exhausted");
+
+      // 2. Fatal Auth Errors (Don't retry)
+      if (status === 401 || status === 403 || errorStr.includes("api_key_invalid")) {
         return "Invalid API Key. Please click the Key icon in the top right to verify your settings.";
       }
-      if (msg.toLowerCase().includes("blocked") || msg.toLowerCase().includes("leaked")) {
-        return "Your API key appears blocked (often due to being flagged as leaked). Create a new key in Google AI Studio and replace the old one.";
+      
+      if (errorStr.includes("blocked") || errorStr.includes("leaked")) {
+        return "Your API key appears blocked (often due to being flagged as leaked). Create a new key in Google AI Studio.";
       }
 
-      const isQuota = status === 429 || /quota|resource_exhausted/i.test(msg);
+      // 3. Retry Logic for Quota or Server errors
       const isServer = status === 500 || status === 503;
-
-      const shouldRetry = (isQuota || isServer) && attempt < maxRetries;
-      if (shouldRetry) {
-        const delay = baseDelay * Math.pow(2, attempt) + Math.floor(Math.random() * 150); // add jitter
-        console.warn(`Attempt ${attempt + 1} failed (status=${status}). Retrying in ${delay}ms...`, msg);
+      if ((isQuota || isServer) && attempt < maxRetries) {
+        // Exponential backoff: 1s, 2s, 4s...
+        const delay = baseDelay * Math.pow(2, attempt) + Math.floor(Math.random() * 200);
+        console.warn(`Attempt ${attempt + 1} failed. Retrying in ${delay}ms...`);
         await sleep(delay);
         continue;
       }
 
-      // Not retryable (or out of retries)
+      // 4. Final Error Return (If retries failed or it's a quota hit we can't bypass)
       if (isQuota) {
-        return "Quota Exceeded: You hit rate limits for your Gemini API key. Slow down requests or check quota/billing.";
+        return "⚠️ API Quota exceeded. The free tier has strict limits (often 15 requests per minute).\n\nPlease wait 60 seconds before trying again, or consider using a paid API key from a billing-enabled project ([https://ai.google.dev/gemini-api/docs/billing](https://ai.google.dev/gemini-api/docs/billing)).";
       }
 
       return `Analysis Failed: ${msg}`;
