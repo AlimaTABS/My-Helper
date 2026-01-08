@@ -33,21 +33,19 @@ export const analyzeTranslation = async (
     return "API Key Missing: Please click the 'Set API Key' button in the header to configure your Google Gemini API key.";
   }
 
-  if (!sourceText.trim() || !targetText.trim()) {
-    return "Please provide both source and target text for analysis.";
-  }
-
   const ai = new GoogleGenAI({ apiKey });
 
+  // Your specific model and high-precision prompt
+  const MODEL_NAME = "gemini-3-pro-preview";
   const prompt = `Target Language: ${targetLanguage}\nSource: ${sourceText}\nTarget: ${targetText}\nReturn JSON.`;
 
   const maxRetries = 3;   
-  const baseDelay = 1000; 
+  const baseDelay = 2000; // Started at 2s to better handle the 15rpm limit
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
       const response = await ai.models.generateContent({
-        model: "gemini-3-pro-preview",
+        model: MODEL_NAME,
         contents: prompt,
         config: {
           responseMimeType: "application/json",
@@ -87,26 +85,27 @@ export const analyzeTranslation = async (
       const msg = String(err?.message ?? err);
       const errorStr = msg.toLowerCase();
 
-      // Fatal Auth Errors
-      if (status === 401 || status === 403 || msg.includes("API_KEY_INVALID")) {
-        return "Invalid API Key. Please click the Key icon in the top right to verify your settings.";
+      // Check specifically for 429 Quota issues
+      const isQuota = status === 429 || errorStr.includes("429") || errorStr.includes("quota");
+      
+      // Check for Auth/Key issues (Don't retry these)
+      if (status === 401 || status === 403 || errorStr.includes("api_key_invalid")) {
+        return "Invalid API Key. Please verify your settings.";
       }
       
       if (errorStr.includes("blocked") || errorStr.includes("leaked")) {
-        return "Your API key appears blocked (often due to being flagged as leaked). Create a new key in Google AI Studio and replace the old one.";
+        return "Your API key is blocked or leaked. Please create a new one in Google AI Studio.";
       }
 
-      // 429 / Quota Error Logic
-      const isQuota = status === 429 || errorStr.includes("429") || errorStr.includes("quota") || errorStr.includes("resource_exhausted");
-      const isServer = status === 500 || status === 503;
-
-      if ((isQuota || isServer) && attempt < maxRetries) {
-        const delay = baseDelay * Math.pow(2, attempt) + Math.floor(Math.random() * 150);
-        console.warn(`Attempt ${attempt + 1} failed. Retrying in ${delay}ms...`, msg);
+      // Retry Logic: If it's a quota hit or server error, wait and try again
+      if ((isQuota || status === 500 || status === 503) && attempt < maxRetries) {
+        const delay = baseDelay * Math.pow(2, attempt) + Math.floor(Math.random() * 500);
+        console.warn(`Retry ${attempt + 1}/${maxRetries} after ${delay}ms due to: ${msg}`);
         await sleep(delay);
         continue;
       }
 
+      // Final failure return for Quota
       if (isQuota) {
         return "⚠️ API Quota exceeded. The free tier has strict limits (often 15 requests per minute).\n\nPlease wait 60 seconds before trying again, or consider using a paid API key from a billing-enabled project ([https://ai.google.dev/gemini-api/docs/billing](https://ai.google.dev/gemini-api/docs/billing)).";
       }
@@ -115,5 +114,5 @@ export const analyzeTranslation = async (
     }
   }
 
-  return "Analysis Failed: Exceeded maximum retries.";
+  return "Analysis Failed: All retry attempts exhausted.";
 };
