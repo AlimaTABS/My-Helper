@@ -1,5 +1,14 @@
 import { GoogleGenAI, Type } from "@google/genai";
 
+export interface AnalysisResult {
+  feedback: string;
+  wordBreakdown: Array<{
+    targetWord: string;
+    sourceEquivalent: string;
+    context: string;
+  }>;
+}
+
 function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -12,36 +21,49 @@ function getStatus(err: any): number | undefined {
   );
 }
 
-function cleanJsonText(s: string) {
-  let t = s.trim();
-  if (t.startsWith("```")) {
-    t = t.replace(/^```[a-zA-Z]*\n?/, "").replace(/```$/, "").trim();
-  }
-  return t;
-}
-
 export const analyzeTranslation = async (
   sourceText: string,
   targetText: string,
   targetLanguage: string,
   userApiKey?: string
-) => {
-  const apiKey =
-    userApiKey || (typeof process !== "undefined" ? process.env.API_KEY : undefined);
+): Promise<AnalysisResult | string> => {
+  const apiKey = userApiKey || (typeof process !== 'undefined' ? process.env.API_KEY : undefined);
 
-  if (!apiKey || apiKey.trim() === "") {
-    return "API Key Missing: Please click the 'Set API Key' button in the header.";
+  if (!apiKey || apiKey.trim() === '') {
+    return "API Key Missing: Please click the 'Set API Key' button in the header to configure your Google Gemini API key.";
+  }
+
+  if (!sourceText.trim() || !targetText.trim()) {
+    return "Please provide both source and target text for analysis.";
   }
 
   const ai = new GoogleGenAI({ apiKey });
+  
+  // Use a stable model ID to avoid 404 errors
+  const MODEL_NAME = "gemini-1.5-pro"; 
 
-  // Use a modern, active model ID
-  const MODEL_NAME = "gemini-2.0-flash"; 
+  const prompt = `
+      You are an expert linguistic auditor performing a high-precision Translation Quality Audit (TQA).
+      
+      Target Language: ${targetLanguage}
+      Source (English): "${sourceText}"
+      Target Translation: "${targetText}"
+      
+      Tasks:
+      1. CRITICAL AUDIT: Identify any of the following issues that contradict the English source text:
+          - Missing Content: Skip words, phrases, or punctuation that alter intent.
+          - Terminology Errors: Use of incorrect or inappropriate terms for the target language context.
+          - Shifts in Meaning: Nuance changes, incorrect tone, or semantic drifting that misrepresents the source.
+          - Summarize these findings in concise bullet points. If perfect, confirm accuracy.
 
-  const prompt = `Target Language: ${targetLanguage}\nSource: ${sourceText}\nTarget: ${targetText}\nReturn JSON.`;
+      2. GRANULAR BREAKDOWN: Provide a word-by-word mapping of the target text to English equivalents.
+          - For each word, explain the grammatical context (e.g., "Noun, plural", "1st person singular verb").
 
-  const maxRetries = 3;   
-  const baseDelay = 1000; 
+      Return results strictly as a JSON object.
+    `;
+
+  const maxRetries = 3;
+  const baseDelay = 1000;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
@@ -53,7 +75,10 @@ export const analyzeTranslation = async (
           responseSchema: {
             type: Type.OBJECT,
             properties: {
-              feedback: { type: Type.STRING },
+              feedback: { 
+                type: Type.STRING,
+                description: "The audit summary focusing on missing content, terminology, and meaning shifts."
+              },
               wordBreakdown: {
                 type: Type.ARRAY,
                 items: {
@@ -72,49 +97,43 @@ export const analyzeTranslation = async (
         },
       });
 
-      const text = response.text;
-      if (!text) throw new Error("Empty response from model.");
+      const result = response.text;
+      if (!result) throw new Error("The AI model returned an empty response.");
+      
+      return JSON.parse(result) as AnalysisResult;
 
-      const cleaned = cleanJsonText(text);
-      let parsed: any = JSON.parse(cleaned);
-      if (typeof parsed === "string") parsed = JSON.parse(parsed);
-
-      return parsed;
-
-    } catch (err: any) {
-      const status = getStatus(err);
-      const msg = String(err?.message ?? err);
+    } catch (error: any) {
+      const status = getStatus(error);
+      const msg = String(error?.message ?? error);
       const errorStr = msg.toLowerCase();
 
-      // 1. Handle Model Not Found (404)
-      if (status === 404 || errorStr.includes("not found")) {
-        return `Model Error: '${MODEL_NAME}' was not found. This usually happens when a model is retired. Try changing the model ID to 'gemini-2.5-flash' or 'gemini-3-pro-preview'.`;
-      }
-
-      // 2. Handle Quota/429 specifically (Your requested logic)
+      // Handle Quota / Rate Limits (429)
       const isQuota = status === 429 || errorStr.includes("429") || errorStr.includes("quota");
       
-      // 3. Fatal Auth Errors
-      if (status === 401 || status === 403 || errorStr.includes("api_key_invalid")) {
-        return "Invalid API Key. Please verify your settings.";
-      }
-
-      // 4. Retry Logic for Quota or Server errors
-      const isServer = status === 500 || status === 503;
-      if ((isQuota || isServer) && attempt < maxRetries) {
+      if (isQuota && attempt < maxRetries) {
         const delay = baseDelay * Math.pow(2, attempt) + Math.floor(Math.random() * 200);
+        console.warn(`Quota hit. Retrying in ${delay}ms...`);
         await sleep(delay);
         continue;
       }
 
-      // 5. Final Quota Message
       if (isQuota) {
-        return "⚠️ API Quota exceeded. The free tier has strict limits (often 15 requests per minute).\n\nPlease wait 60 seconds before trying again, or consider using a paid API key from a billing-enabled project ([https://ai.google.dev/gemini-api/docs/billing](https://ai.google.dev/gemini-api/docs/billing)).";
+        return "⚠️ API Quota exceeded. The free tier has strict limits (often 15 requests per minute).\n\nPlease wait 60 seconds before trying again, or consider using a paid API key from a billing-enabled project (https://ai.google.dev/gemini-api/docs/billing).";
+      }
+
+      // Handle Invalid Keys (401/403)
+      if (status === 401 || status === 403 || errorStr.includes("api_key_invalid")) {
+        return "Invalid API Key: The key you provided was rejected by Google. Please check your settings.";
+      }
+
+      // Handle Model Not Found (404)
+      if (status === 404 || errorStr.includes("not found")) {
+        return `Error: Model '${MODEL_NAME}' not found. Please try 'gemini-1.5-flash' or check your API version.`;
       }
 
       return `Analysis Failed: ${msg}`;
     }
   }
 
-  return "Analysis Failed: Exceeded maximum retries.";
+  return "Analysis Failed: Maximum retries reached due to rate limiting.";
 };
