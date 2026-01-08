@@ -9,126 +9,87 @@ export interface AnalysisResult {
   }>;
 }
 
-const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+const delay = (ms: number) => new Promise(res => setTimeout(res, ms));
 
 export const analyzeTranslation = async (
   sourceText: string,
   targetText: string,
   targetLanguage: string,
-  userApiKey?: string
+  userApiKey?: string,
+  retryCount = 0
 ): Promise<AnalysisResult | string> => {
   const apiKey = userApiKey || (typeof process !== 'undefined' ? process.env.API_KEY : undefined);
 
   if (!apiKey || apiKey.trim() === '') {
-    return "API Key Missing: Please click the 'API Key' button in the header to configure your Google Gemini API key.";
+    return "API Key Missing: Please click the 'API Key' button in the header to set your key.";
   }
 
-  if (!sourceText.trim() || !targetText.trim()) {
-    return "Please provide both source and target text for analysis.";
-  }
+  try {
+    // ALWAYS create a fresh instance to avoid stale config
+    const ai = new GoogleGenAI({ apiKey });
 
-  const maxRetries = 4; 
-  let attempt = 0;
+    // Force 'gemini-3-flash-preview' for significantly higher RPM limits
+    const response = await ai.models.generateContent({
+      model: 'gemini-3-flash-preview',
+      contents: `
+        Audit this translation. 
+        ENGLISH SOURCE: "${sourceText}"
+        ${targetLanguage} TARGET: "${targetText}"
 
-  while (attempt < maxRetries) {
-    try {
-      const ai = new GoogleGenAI({ apiKey });
-
-      const prompt = `
-        You are an expert linguistic auditor performing a high-precision Translation Quality Audit (TQA).
-        
-        Target Language: ${targetLanguage}
-        Source (English): "${sourceText}"
-        Target Translation: "${targetText}"
-        
-        TASK 1: CRITICAL AUDIT
-        Compare the translation to the source. Identify mistranslations, omissions, or tone shifts.
-        Provide feedback in clear bullet points.
-
-        TASK 2: WORD-BY-WORD MAPPING
-        You MUST provide a granular mapping for every significant word or semantic unit in the TARGET translation.
-        Identify the corresponding English word from the source and its grammatical context.
-        DO NOT leave the wordBreakdown array empty. Even if the translation is perfect, map every word.
-
-        EXAMPLE MAPPING FORMAT:
-        If Target is "Hola mundo" and Source is "Hello world":
-        - targetWord: "Hola", sourceEquivalent: "Hello", context: "Interjection, greeting"
-        - targetWord: "mundo", sourceEquivalent: "world", context: "Noun, singular"
-
-        Return results strictly as a JSON object matching the requested schema.
-      `;
-
-      // Use gemini-3-flash-preview for significantly higher rate limits on free tier
-      const response = await ai.models.generateContent({
-        model: 'gemini-3-flash-preview',
-        contents: prompt,
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              feedback: { 
-                type: Type.STRING,
-                description: "The audit summary focusing on quality, accuracy, and suggested corrections."
-              },
-              wordBreakdown: {
-                type: Type.ARRAY,
-                description: "A complete mapping of every word in the translation to its source equivalent.",
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    targetWord: { type: Type.STRING },
-                    sourceEquivalent: { type: Type.STRING },
-                    context: { type: Type.STRING },
-                  },
-                  required: ["targetWord", "sourceEquivalent", "context"],
+        TASKS:
+        1. Feedback: Summarize accuracy and style errors.
+        2. Breakdown: Provide a word-by-word mapping for every word in the target translation.
+      `,
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            feedback: { type: Type.STRING },
+            wordBreakdown: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  targetWord: { type: Type.STRING },
+                  sourceEquivalent: { type: Type.STRING },
+                  context: { type: Type.STRING },
                 },
+                required: ["targetWord", "sourceEquivalent", "context"],
               },
             },
-            required: ["feedback", "wordBreakdown"],
           },
+          required: ["feedback", "wordBreakdown"],
         },
-      });
+      },
+    });
 
-      const resultText = response.text;
-      if (!resultText) throw new Error("Empty response from AI service.");
-      
-      const parsed = JSON.parse(resultText);
-      
-      if (!parsed.wordBreakdown || parsed.wordBreakdown.length === 0) {
-        throw new Error("AI failed to generate word mapping. Please try again.");
-      }
+    const text = response.text;
+    if (!text) throw new Error("Empty response from AI");
+    
+    return JSON.parse(text) as AnalysisResult;
 
-      return parsed as AnalysisResult;
+  } catch (error: any) {
+    console.error(`Gemini Error (Attempt ${retryCount + 1}):`, error);
 
-    } catch (error: any) {
-      const isRateLimit = error.message?.includes("429") || 
-                          error.message?.includes("quota") || 
-                          error.message?.includes("limit") ||
-                          error.status === 429;
-      
-      if (isRateLimit && attempt < maxRetries - 1) {
-        attempt++;
-        // Use exponential backoff with jitter: 3s, 7s, 13s...
-        const delay = (Math.pow(2, attempt) * 1500) + (Math.random() * 1500) + 1000; 
-        console.warn(`Rate limit (429) hit. Attempt ${attempt}/${maxRetries}. Retrying in ${Math.round(delay)}ms...`);
-        await sleep(delay);
-        continue;
-      }
+    const errorMessage = error.message || "";
 
-      console.error("Analysis Error:", error);
-      
-      if (error.message?.includes("401")) {
-        return "Invalid API Key: Your key was rejected by Google. Please check your settings.";
-      }
-      
-      if (isRateLimit) {
-        return "⚠️ API Quota exceeded. The free tier has strict limits (often 15 requests per minute).\n\nPlease wait 60 seconds before trying again, or consider using a paid API key from a billing-enabled project (https://ai.google.dev/gemini-api/docs/billing).";
-      }
-      
-      return `Analysis Failed: ${error.message || "An unexpected error occurred."}`;
+    // 429 Handling with Exponential Backoff
+    if (errorMessage.includes("429") && retryCount < 3) {
+      const waitTime = Math.pow(2, retryCount) * 2000;
+      console.warn(`Quota hit. Retrying in ${waitTime}ms...`);
+      await delay(waitTime);
+      return analyzeTranslation(sourceText, targetText, targetLanguage, userApiKey, retryCount + 1);
     }
-  }
 
-  return "The service is temporarily unavailable due to high demand (Rate Limit). Please wait a few moments before trying again.";
+    if (errorMessage.includes("429")) {
+      return "QUOTA EXCEEDED (429): You have reached the limit for free requests. Please wait 60 seconds and try again. Using a paid API key or 'Gemini Flash' model helps avoid this.";
+    }
+
+    if (errorMessage.includes("401")) {
+      return "INVALID API KEY: The key you provided is not working. Please check it in the settings.";
+    }
+
+    return `ANALYSIS FAILED: ${errorMessage.substring(0, 150)}...`;
+  }
 };
