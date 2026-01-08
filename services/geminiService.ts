@@ -9,10 +9,12 @@ export interface AnalysisResult {
   }>;
 }
 
+// Helper to wait between retries
 function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+// Helper to extract status codes from various error formats
 function getStatus(err: any): number | undefined {
   return (
     err?.status ??
@@ -38,9 +40,6 @@ export const analyzeTranslation = async (
   }
 
   const ai = new GoogleGenAI({ apiKey });
-  
-  // Use a stable model ID to avoid 404 errors
-  const MODEL_NAME = "gemini-1.5-pro"; 
 
   const prompt = `
       You are an expert linguistic auditor performing a high-precision Translation Quality Audit (TQA).
@@ -57,7 +56,7 @@ export const analyzeTranslation = async (
           - Summarize these findings in concise bullet points. If perfect, confirm accuracy.
 
       2. GRANULAR BREAKDOWN: Provide a word-by-word mapping of the target text to English equivalents.
-          - For each word, explain the grammatical context (e.g., "Noun, plural", "1st person singular verb").
+          - For each word, explain the grammatical context (e.g., "Noun, plural", "1st person singular verb", "Direct object marker").
 
       Return results strictly as a JSON object.
     `;
@@ -68,7 +67,7 @@ export const analyzeTranslation = async (
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
       const response = await ai.models.generateContent({
-        model: MODEL_NAME,
+        model: 'gemini-3-pro-preview', // Kept your original model name
         contents: prompt,
         config: {
           responseMimeType: "application/json",
@@ -107,33 +106,30 @@ export const analyzeTranslation = async (
       const msg = String(error?.message ?? error);
       const errorStr = msg.toLowerCase();
 
-      // Handle Quota / Rate Limits (429)
+      // Check for Quota/Rate Limit (429)
       const isQuota = status === 429 || errorStr.includes("429") || errorStr.includes("quota");
-      
-      if (isQuota && attempt < maxRetries) {
-        const delay = baseDelay * Math.pow(2, attempt) + Math.floor(Math.random() * 200);
-        console.warn(`Quota hit. Retrying in ${delay}ms...`);
+
+      // Retry if it's a Quota issue or Server error
+      if ((isQuota || status === 500 || status === 503) && attempt < maxRetries) {
+        const delay = baseDelay * Math.pow(2, attempt) + Math.floor(Math.random() * 150);
+        console.warn(`Attempt ${attempt + 1} failed. Retrying in ${delay}ms...`);
         await sleep(delay);
         continue;
       }
 
+      // If we reach here and it's still a quota error, return your specific message
       if (isQuota) {
         return "⚠️ API Quota exceeded. The free tier has strict limits (often 15 requests per minute).\n\nPlease wait 60 seconds before trying again, or consider using a paid API key from a billing-enabled project (https://ai.google.dev/gemini-api/docs/billing).";
       }
 
-      // Handle Invalid Keys (401/403)
+      // Handle other fatal errors
       if (status === 401 || status === 403 || errorStr.includes("api_key_invalid")) {
-        return "Invalid API Key: The key you provided was rejected by Google. Please check your settings.";
-      }
-
-      // Handle Model Not Found (404)
-      if (status === 404 || errorStr.includes("not found")) {
-        return `Error: Model '${MODEL_NAME}' not found. Please try 'gemini-1.5-flash' or check your API version.`;
+        return "Invalid API Key: Please check your settings.";
       }
 
       return `Analysis Failed: ${msg}`;
     }
   }
 
-  return "Analysis Failed: Maximum retries reached due to rate limiting.";
+  return "Analysis Failed: Exceeded maximum retries.";
 };
