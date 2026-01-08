@@ -1,0 +1,5 @@
+{
+  "name": "My proofer",
+  "description": "A professional translation quality control interface that allows users to compare English source text with a target language translation using AI-powered semantic analysis.",
+  "requestFramePermissions": []
+}
