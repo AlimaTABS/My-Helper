@@ -153,7 +153,7 @@ const App: React.FC = () => {
       <footer className="bg-white border-t border-slate-200 py-10">
         <div className="max-w-7xl mx-auto px-4 text-center">
           <p className="text-slate-400 text-[10px] font-black uppercase tracking-[0.3em]">
-            © {new Date().getFullYear()} Shepherds Global Classroom
+            © {new Date().getFullYear()} 
           </p>
         </div>
       </footer>
